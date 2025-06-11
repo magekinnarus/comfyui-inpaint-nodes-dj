@@ -31,6 +31,8 @@ from .util import (
     undo_resize_square,
 )
 
+INPAINT_HEAD_TYPE = "INPAINT_HEAD" # Add these lines if not already at top
+INPAINT_LORA_TYPE = "INPAINT_LORA"
 
 class InpaintHead(torch.nn.Module):
     def __init__(self, *args, **kwargs):
@@ -109,30 +111,37 @@ def inject_patched_calculate_weight():
         injected_model_patcher_calculate_weight = True
 
 
-class LoadFooocusInpaint:
+class LoadFooocusInpaint: # Renamed to reflect it loads both components separately
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "head": (folder_paths.get_filename_list("inpaint"),),
-                "patch": (folder_paths.get_filename_list("inpaint"),),
+                "head_file": (folder_paths.get_filename_list("inpaint"), {"default": "fooocus_inpaint_head.pth"}), # Renamed for clarity
+                "lora_file": (folder_paths.get_filename_list("inpaint"), {"default": "fooocus_inpaint_patch.safetensors"}), # Renamed for clarity
             }
         }
 
-    RETURN_TYPES = ("INPAINT_PATCH",)
+    RETURN_TYPES = (INPAINT_HEAD_TYPE, INPAINT_LORA_TYPE) # Return both separately
+    RETURN_NAMES = ("INPAINT_HEAD", "INPAINT_LORA") # Names for the outputs
     CATEGORY = "inpaint"
-    FUNCTION = "load"
+    FUNCTION = "load_models" # Renamed function for clarity
 
-    def load(self, head: str, patch: str):
-        head_file = folder_paths.get_full_path("inpaint", head)
+    def load_models(self, head_file: str, lora_file: str):
+        # Load Inpaint Head Model
+        head_full_path = folder_paths.get_full_path("inpaint", head_file)
+        if head_full_path is None:
+            raise RuntimeError(f"Head file not found: {head_file}")
         inpaint_head_model = InpaintHead()
-        sd = torch.load(head_file, map_location="cpu", weights_only=True)
-        inpaint_head_model.load_state_dict(sd)
+        sd_head = torch.load(head_full_path, map_location="cpu", weights_only=True)
+        inpaint_head_model.load_state_dict(sd_head)
 
-        patch_file = folder_paths.get_full_path("inpaint", patch)
-        inpaint_lora = comfy.utils.load_torch_file(patch_file, safe_load=True)
+        # Load Inpaint LoRA Patch
+        lora_full_path = folder_paths.get_full_path("inpaint", lora_file)
+        if lora_full_path is None:
+            raise RuntimeError(f"LoRA file not found: {lora_file}")
+        inpaint_lora = comfy.utils.load_torch_file(lora_full_path, safe_load=True)
 
-        return ((inpaint_head_model, inpaint_lora),)
+        return (inpaint_head_model, inpaint_lora)
 
 
 class ApplyFooocusInpaint:
@@ -141,8 +150,12 @@ class ApplyFooocusInpaint:
         return {
             "required": {
                 "model": ("MODEL",),
-                "patch": ("INPAINT_PATCH",),
+                "inpaint_head": (INPAINT_HEAD_TYPE,), # Now directly takes the head model
                 "latent": ("LATENT",),
+            },
+            "optional": { # LoRA is now optional
+                "inpaint_lora": (INPAINT_LORA_TYPE, {"default": None}), # Optional input
+                "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
 
@@ -156,8 +169,10 @@ class ApplyFooocusInpaint:
     def patch(
         self,
         model: ModelPatcher,
-        patch: tuple[InpaintHead, dict[str, Tensor]],
+        inpaint_head: InpaintHead, # Direct InpaintHead instance
         latent: dict[str, Any],
+        inpaint_lora: dict[str, Tensor] | None = None, # Optional LoRA dict
+        lora_strength: float = 1.0, # LoRA strength
     ):
         base_model: BaseModel = model.model
         latent_pixels = base_model.process_latent_in(latent["samples"])
@@ -165,31 +180,42 @@ class ApplyFooocusInpaint:
 
         latent_mask = F.max_pool2d(noise_mask, (8, 8)).round().to(latent_pixels)
 
-        inpaint_head_model, inpaint_lora = patch
+        # Always process and inject the InpaintHead feature, as per your finding
+        # that it's crucial for proper fitting, even without LoRA.
         feed = torch.cat([latent_mask, latent_pixels], dim=1)
-        inpaint_head_model.to(device=feed.device, dtype=feed.dtype)
-        self._inpaint_head_feature = inpaint_head_model(feed)
+        inpaint_head.to(device=feed.device, dtype=feed.dtype) # Use inpaint_head directly
+        self._inpaint_head_feature = inpaint_head(feed)
         self._inpaint_block = None
 
-        lora_keys = comfy.lora.model_lora_keys_unet(model.model, {})
-        lora_keys.update({x: x for x in base_model.state_dict().keys()})
-        loaded_lora = load_fooocus_patch(inpaint_lora, lora_keys)
+        m = model.clone() # Clone the model to apply patches without modifying original
 
-        m = model.clone()
+        # Set the input block patch for the InpaintHead feature
         m.set_model_input_block_patch(self._input_block_patch)
-        patched = m.add_patches(loaded_lora, 1.0)
 
-        not_patched_count = sum(1 for x in loaded_lora if x not in patched)
-        if not_patched_count > 0:
-            print(f"[ApplyFooocusInpaint] Failed to patch {not_patched_count} keys")
+        # Conditionally apply LoRA patches if inpaint_lora is provided
+        if inpaint_lora is not None:
+            lora_keys = comfy.lora.model_lora_keys_unet(model.model, {})
+            lora_keys.update({x: x for x in base_model.state_dict().keys()}) # Ensure all keys are considered
+            loaded_lora = load_fooocus_patch(inpaint_lora, lora_keys)
 
+            # Apply LoRA with the specified strength
+            patched = m.add_patches(loaded_lora, lora_strength)
+
+            not_patched_count = sum(1 for x in loaded_lora if x not in patched)
+            if not_patched_count > 0:
+                print(f"[ApplyFooocusInpaint] Failed to apply {not_patched_count} LoRA keys")
+        else:
+            print("[ApplyFooocusInpaint] No Inpaint LoRA provided. Running without LoRA patches.")
+
+        # Ensure the patched calculate_weight is injected (this only happens once)
         inject_patched_calculate_weight()
         return (m,)
 
     def _input_block_patch(self, h: Tensor, transformer_options: dict):
+        # This function remains largely the same, as it's just the mechanism for the head injection
         if transformer_options["block"][1] == 0:
             if self._inpaint_block is None or self._inpaint_block.shape != h.shape:
-                assert self._inpaint_head_feature is not None
+                assert self._inpaint_head_feature is not None, "InpaintHead feature is None, but _input_block_patch is active."
                 batch = h.shape[0] // self._inpaint_head_feature.shape[0]
                 self._inpaint_block = self._inpaint_head_feature.to(h).repeat(batch, 1, 1, 1)
             h = h + self._inpaint_block
